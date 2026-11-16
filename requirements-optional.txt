@@ -1,0 +1,19 @@
+# --------------------------------------------------------------------------
+# Optional extras.  The application runs without them: it falls back to the
+# classical detectors and says so in every result and report.
+# --------------------------------------------------------------------------
+
+# DICOM support (also imported lazily; PNG/JPG/TIFF work without it)
+pydicom>=2.4
+
+# Test suite
+pytest>=7.4
+
+# Deep-learning detectors.  Install the CPU build of torch for the wheel size
+# that fits the machine:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.1
+torchvision>=0.16
+ultralytics>=8.2      # YOLOv8/YOLO11 + RT-DETR inference and training
+onnxruntime>=1.17     # ONNX checkpoints (optional)
+pyyaml>=6.0           # training/evaluation config files

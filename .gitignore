@@ -1,0 +1,125 @@
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# ==============================
+# IDEs and Editors
+# ==============================
+.vscode/
+.idea/
+*.sublime-workspace
+*.swp
+*.swo
+
+# ==============================
+# Jupyter
+# ==============================
+.ipynb_checkpoints/
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+logs/
+log/
+temp/
+tmp/
+*.tmp
+*.bak
+*.old
+*.orig
+
+# ==============================
+# Cache
+# ==============================
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==============================
+# OS generated files
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ==============================
+# Application outputs
+# ==============================
+output/
+outputs/
+results/
+reports/
+debug/
+screenshots/
+exports/
+
+# ==============================
+# Model training artifacts
+# ==============================
+runs/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+
+# ==============================
+# Model weights - review before committing
+# ==============================
+# Ignore training checkpoints and temporary weights
+runs/
+wandb/
+mlruns/
+
+# Keep project models
+!src/models/
+!src/models/**/*.pt
+!src/models/**/*.pth
+!src/models/**/*.onnx
+
+# ==============================
+# Dataset and large image files
+# ==============================
+datasets/
+dataset/
+data/raw/
+data/processed/
+*.dcm
+*.dicom
+*.nii
+*.nii.gz
+
+# ==============================
+# Local configuration and secrets
+# ==============================
+.env
+.env.*
+!.env.example
+secrets/
+credentials.json
+config.local.*

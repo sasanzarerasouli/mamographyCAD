@@ -1,0 +1,12 @@
+# Core runtime dependencies (CPU only, installable in a 1 GB container)
+numpy>=1.24
+opencv-python>=4.8
+scikit-image>=0.21
+scikit-learn>=1.3
+scipy>=1.10
+PyQt6>=6.5
+
+# Optional but strongly recommended for real clinical files:
+#   pydicom  -> DICOM (MONOCHROME1/2, 16-bit, WindowCenter/Width)
+#   pytest   -> test suite
+#   torch / ultralytics -> deep-learning detectors (see below)

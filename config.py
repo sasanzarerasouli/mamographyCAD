@@ -1,0 +1,169 @@
+"""Central configuration for Mammography CAD application."""
+import os
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+
+class Config:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+    SESSION_DIR = os.path.join(BASE_DIR, "sessions")
+    REPORTS_DIR = os.path.join(OUTPUT_DIR, "reports")
+    ANNOTATIONS_DIR = os.path.join(OUTPUT_DIR, "annotations")
+
+    # ------------------------------------------------------------------
+    # Model assets (read-only: trained weights are never overwritten)
+    # ------------------------------------------------------------------
+    MODEL_DIR = os.environ.get("CAD_MODEL_DIR", os.path.join(BASE_DIR, "model"))
+    DIGITAL_EYE_DIR = os.path.join(MODEL_DIR, "digital_eye")
+    MASS_MODEL_DIR = os.path.join(MODEL_DIR, "mass")
+    CALC_MODEL_DIR = os.path.join(MODEL_DIR, "calcification")
+
+    # Explicit checkpoint overrides (empty string -> auto-discovery)
+    MASS_MODEL_PATH = os.environ.get("CAD_MASS_MODEL", "")
+    CALC_MODEL_PATH = os.environ.get("CAD_CALC_MODEL", "")
+
+    # ------------------------------------------------------------------
+    # Deep-learning inference settings (CPU friendly defaults)
+    # ------------------------------------------------------------------
+    # "auto"   -> use a deep model when a checkpoint is discoverable AND the
+    #            runtime (torch/ultralytics) is importable, otherwise fall
+    #            back to the classical detectors.
+    # "on"     -> force deep model usage (errors if unavailable)
+    # "off"    -> always use the classical detectors
+    DETECTION_BACKEND = os.environ.get("CAD_DETECTION_BACKEND", "auto").lower()
+
+    DL_DEVICE = os.environ.get("CAD_DEVICE", "cpu")     # cpu | 0 (cuda index)
+    DL_IMAGE_SIZE = 1024                                 # full-image inference size
+    DL_MULTI_SCALE_SIZES: Tuple[int, ...] = (1024, 1536)  # multi-scale inference
+    DL_CONF_THRESHOLD = 0.25
+    DL_IOU_THRESHOLD = 0.45                              # NMS IoU for merging boxes
+
+    # Overlapping patch inference (critical for microcalcifications)
+    CALC_PATCH_SIZE = 640
+    CALC_PATCH_OVERLAP = 0.30
+    CALC_PATCH_ENABLED = True
+
+    # Mass detection uses full-image inference with a single extra scale
+    MASS_MULTI_SCALE: Tuple[int, ...] = (1024, 1280)
+
+    # Maximum detections kept per image / task (guards CPU memory)
+    MAX_DETECTIONS_PER_TASK = 300
+
+    # Class-name -> detection kind mapping used by the deep backend.
+    # Any checkpoint class containing one of these tokens is routed to the
+    # corresponding task; unknown classes are reported, never guessed.
+    MASS_CLASS_TOKENS: Tuple[str, ...] = ("mass", "tumor", "tumour", "lesion", "cancer")
+    CALC_CLASS_TOKENS: Tuple[str, ...] = (
+        "calc", "microcalc", "macrocalc", "micro", "macro", "clusterc"
+    )
+
+    # Detection thresholds
+    MIN_TUMOR_AREA = 100
+    SUSPICIOUS_THRESHOLD = 0.6
+    CONFIRMED_THRESHOLD = 0.8
+    DETECTION_THRESHOLD = 0.5
+    CONFIDENCE_THRESHOLD = 0.6
+
+    # Calcification
+    MICRO_SIZE_RANGE: Tuple[int, int] = (1, 10)
+    MACRO_SIZE_RANGE: Tuple[int, int] = (10, 50)
+    CALCIFICATION_SENSITIVITY = 0.5
+    CLUSTER_THRESHOLD = 3
+
+    # BI-RADS calcification descriptors (ACR lexicon, software-assisted)
+    CALC_CLUSTER_MIN_COUNT = 3          # >= 3 calcifications within the cluster radius
+    CALC_CLUSTER_RADIUS_MM = 10.0       # 1 cm grouping radius for "grouped" distribution
+    CALC_SEGMENTAL_LENGTH_MM = 20.0     # >2 cm extent along a duct -> linear/segmental
+    CALC_MAX_DENSITY_LABEL = "software-estimated"
+
+    # Segmentation
+    SEG_ADAPTIVE_BLOCK_SIZE = 11
+    SEG_ADAPTIVE_C = 2
+    SEG_MORPH_CLOSE_KERNEL = 25
+    SEG_MORPH_OPEN_KERNEL = 5
+    SEG_SMOOTH_KERNEL = 21
+
+    # Risk scoring feature weights.
+    # NOTE: this used to be built with dataclasses.field(), which is only valid
+    # inside an @dataclass body. Outside of it, `field(...)` returns a Field
+    # object, so `Config.RISK_WEIGHTS.get(...)` raised AttributeError and the
+    # whole lesion risk stage failed silently. A plain dict is correct here.
+    RISK_WEIGHTS: Dict[str, float] = {
+        "shape_irregularity": 0.15,
+        "circularity": 0.10,
+        "spiculation": 0.20,
+        "edge_sharpness": 0.10,
+        "contrast": 0.15,
+        "texture_entropy": 0.15,
+        "density_difference": 0.15,
+    }
+
+    # Density classification thresholds (dense area %)
+    DENSITY_THRESHOLDS: Dict[str, float] = {
+        "A": 0.25,
+        "B": 0.50,
+        "C": 0.75,
+    }
+
+    # BI-RADS decision thresholds
+    BIRADS_THRESHOLDS: Dict[str, float] = {
+        "birads_2_max": 0.20,
+        "birads_3_max": 0.40,
+        "birads_4_max": 0.70,
+    }
+
+    # Visualization
+    MASK_OPACITY = 0.5
+    LINE_THICKNESS = 2
+    ARROW_THICKNESS = 2
+    HEATMAP_OPACITY = 0.45
+
+    # Processing
+    DEFAULT_BACKEND = "cpu"
+    DEBUG_MODE = False
+
+    DISCLAIMER = (
+        "This assessment is generated by software for research and decision-support "
+        "purposes only and is not a medical diagnosis. It is not a radiologist "
+        "report: every finding must be reviewed and confirmed by a qualified "
+        "radiologist."
+    )
+    REPORT_DISCLAIMER = (
+        "This report is generated by software for research and decision-support purposes "
+        "only and is not intended to replace clinical judgment, radiologist interpretation, "
+        "or medical diagnosis."
+    )
+    BIRADS_LABEL = "Software-Assisted BI-RADS Estimation"
+
+    # Minimum confidence a detection needs before it is allowed to drive a
+    # suspicious BI-RADS category. Below the threshold the finding can only
+    # support categories 0-3.
+    BIRADS_MIN_FINDING_CONFIDENCE = 0.60
+
+    # Fallback pixel spacing (mm/pixel) used when the file carries no spacing
+    # (plain PNG/JPG, or a DICOM without PixelSpacing).  It is an assumption,
+    # not a measurement: every result derived from it is flagged with
+    # ``spacing_assumed`` / ``spacing_known`` and the report prints the basis.
+    ASSUMED_PIXEL_SPACING_MM = 0.05
+    # A detection produced by the classical fallback pipeline is explicitly
+    # flagged as unvalidated in the report when no trained model is present.
+    BIRADS_UNVALIDATED_LABEL = (
+        "Unvalidated detection backend - BI-RADS categories are software "
+        "estimates and must not be used for clinical decisions."
+    )
+
+
+# Runtime/output directories are created on import.  Model directories are
+# created too (empty) so a checkpoint can be dropped in without any setup step;
+# existing weights are never touched.
+for _path in (
+    Config.OUTPUT_DIR,
+    Config.SESSION_DIR,
+    Config.REPORTS_DIR,
+    Config.ANNOTATIONS_DIR,
+    Config.MODEL_DIR,
+    Config.MASS_MODEL_DIR,
+    Config.CALC_MODEL_DIR,
+):
+    os.makedirs(_path, exist_ok=True)
