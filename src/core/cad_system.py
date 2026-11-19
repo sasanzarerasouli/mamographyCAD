@@ -112,12 +112,15 @@ class MammographyCADSystem:
         self, gray: np.ndarray, metadata: Optional[Dict[str, Any]] = None
     ) -> AnalysisResult:
         """Analyse an in-memory grayscale array (used by tests and batch jobs)."""
-        return self._analyze_gray(
+        result = self._analyze_gray(
             image_path="<array>",
             gray=MammographyPreprocessor.to_uint8(gray),
             metadata=metadata or {},
             progress_callback=None,
         )
+        result.source_pixels = np.array(gray, copy=True)
+        result.source_pixels.flags.writeable = False
+        return result
 
     # ================================================================== #
     #  Main entry point                                                  #
@@ -128,7 +131,8 @@ class MammographyCADSystem:
         if progress_callback:
             progress_callback(3)
 
-        gray, metadata = MammographyPreprocessor.load_image(image_path)
+        retained_pixels = []
+        gray, metadata = MammographyPreprocessor.load_image(image_path, source_pixels=retained_pixels)
         if progress_callback:
             progress_callback(10)
 
@@ -138,7 +142,11 @@ class MammographyCADSystem:
             metadata=metadata,
             progress_callback=progress_callback,
         )
+        if retained_pixels:
+            result.source_pixels = retained_pixels[0]
+            result.source_pixels.flags.writeable = False
         result.processing_time = time.time() - start
+        logger.info("Pipeline duration: %.2fs", result.processing_time)
         return result
 
     # ================================================================== #
@@ -170,10 +178,12 @@ class MammographyCADSystem:
         image_meta = dict((metadata or {}).get("image", {}) or {})
         spacing = _resolve_spacing(image_meta)
         # Was the spacing measured (DICOM PixelSpacing) or assumed?
-        raw_spacing = (image_meta.get("image") or {}).get("pixel_spacing")
+        raw_spacing = image_meta.get("pixel_spacing")
         try:
             spacing_known = bool(
                 raw_spacing
+                and image_meta.get("spacing_known", tuple(raw_spacing) != (1., 1.))
+                and np.isfinite(raw_spacing[:2]).all()
                 and float(raw_spacing[0]) > 0
                 and float(raw_spacing[1]) > 0
             )
@@ -229,11 +239,15 @@ class MammographyCADSystem:
         progress(36)
 
         # ---------------- 5. mass detection ---------------------------- #
-        mass_detections = self._detect_masses(enhanced, breast_mask, warnings)
+        mass_input = enhanced
+        if np.any(pre_pectoral_mask):
+            mass_input = MammographyPreprocessor.enhance_contrast(pre["cleaned"], breast_mask)
+        mass_detections = self._detect_masses(mass_input, breast_mask, warnings)
+        self._annotate_pectoral_overlap(mass_detections, pectoral_mask, pectoral_confidence)
         progress(55)
 
         # ---------------- 6. calcification detection ------------------- #
-        calc_detections = self._detect_calcifications(enhanced, breast_mask, warnings)
+        calc_detections = self._detect_calcifications(enhanced, breast_mask, warnings, spacing=spacing if spacing_known else None)
         progress(68)
 
         detections = self._finalise_detections(
@@ -378,13 +392,7 @@ class MammographyCADSystem:
             },
         )
 
-        logger.info(
-            "Analysis complete: %d detection(s), BI-RADS %s, density %s, %.2fs",
-            len(detections),
-            (birads_result or {}).get("category"),
-            (density_result or {}).get("acr_category"),
-            result.processing_time,
-        )
+        logger.info("Analysis stages complete: %d detection(s)", len(detections))
         progress(98)
         return result
 
@@ -418,14 +426,13 @@ class MammographyCADSystem:
         if self._deep_checked:
             return
         self._deep_checked = True
-        if Config.DETECTION_BACKEND == "off":
+        if not Config.TRUST_LOCAL_CHECKPOINTS or Config.DETECTION_BACKEND == "off":
             self.backend_notes.append(
-                "Detection backend was disabled in the settings: the classical "
+                "Optional deep inference was disabled or not explicitly trusted: the classical "
                 "(unvalidated) detectors were used."
             )
             return
         try:
-            self.deep_mass_backend = get_backend("mass", self.model_registry)
             self.deep_calc_backend = get_backend("calcification", self.model_registry)
         except Exception as exc:  # pragma: no cover - runtime specific
             logger.warning("Deep backend initialisation failed: %s", exc)
@@ -433,50 +440,32 @@ class MammographyCADSystem:
             self.deep_calc_backend = None
             self.backend_notes.append(f"Deep backend initialisation failed: {exc}")
 
-        if self.deep_mass_backend is None or self.deep_calc_backend is None:
-            missing = []
-            if self.deep_mass_backend is None:
-                missing.append("mass")
-            if self.deep_calc_backend is None:
-                missing.append("calcification")
-            reason = last_error("mass") or last_error("calcification") or ""
-            requested = Config.DETECTION_BACKEND == "on"
-            self.backend_notes.append(
-                ("Deep detection was requested but is unavailable for "
-                 if requested else
-                 "No usable trained checkpoint found for ")
-                + ", ".join(missing)
-                + " - the classical (unvalidated) detector was used instead."
-                + (f" ({reason})" if reason else "")
-            )
+        if self.deep_calc_backend is None:
+            reason = last_error("calcification") or "no compatible checkpoint"
+            self.backend_notes.append(f"Deep calcification backend unavailable ({reason}); classical detector used.")
+
+    @staticmethod
+    def _annotate_pectoral_overlap(detections, mask, confidence):
+        if mask is None or not np.any(mask):
+            return
+        strength = float(np.clip(confidence if confidence is not None else 0., 0., 1.))
+        for detection in detections:
+            x, y = detection.location
+            if detection.mask is not None:
+                region = detection.mask > 0
+                overlap = float(np.count_nonzero(region & (mask > 0)) / max(1, region.sum()))
+            else:
+                overlap = float(mask[y, x] > 0)
+            detection.features['pectoral_overlap'] = overlap
+            detection.features['pectoral_mask_score'] = strength
+            if overlap >= Config.ANATOMY_PECTORAL_REVIEW_OVERLAP:
+                detection.features['needs_review'] = True
+                detection.features['pre_anatomy_score'] = detection.confidence
+                detection.confidence *= 1 - Config.ANATOMY_PECTORAL_MAX_PENALTY * strength * overlap
 
     def _detect_masses(
         self, enhanced: np.ndarray, breast_mask: np.ndarray, warnings: List[str]
     ) -> List[Detection]:
-        self._ensure_deep_backends()
-
-        if self.deep_mass_backend is not None:
-            try:
-                raw = self.deep_mass_backend.predict(
-                    enhanced,
-                    tile=False,
-                    scales=Config.MASS_MULTI_SCALE,
-                    conf=Config.DL_CONF_THRESHOLD,
-                )
-                detections = self.deep_mass_backend.to_detections(
-                    raw, enhanced.shape, breast_mask
-                )
-                if Config.DETECTION_BACKEND == "on" or detections:
-                    logger.info("Mass detection: deep backend -> %d", len(detections))
-                    return detections
-                warnings.append(
-                    "Deep mass model returned no candidates; classical detector "
-                    "was used as a supplementary pass."
-                )
-            except Exception as exc:
-                warnings.append(f"Deep mass detection failed: {exc}")
-                logger.exception("Deep mass detection failed")
-
         try:
             detections = self.tumor_detector.detect(enhanced, breast_mask)
         except Exception as exc:
@@ -488,7 +477,7 @@ class MammographyCADSystem:
         return detections
 
     def _detect_calcifications(
-        self, enhanced: np.ndarray, breast_mask: np.ndarray, warnings: List[str]
+        self, enhanced: np.ndarray, breast_mask: np.ndarray, warnings: List[str], *, spacing=None
     ) -> List[Detection]:
         self._ensure_deep_backends()
 
@@ -519,7 +508,7 @@ class MammographyCADSystem:
                 logger.exception("Deep calcification detection failed")
 
         try:
-            detections = self.calcification_detector.detect(enhanced, breast_mask)
+            detections = self.calcification_detector.detect(enhanced, breast_mask, spacing=spacing)
         except Exception as exc:
             warnings.append(f"Calcification detection failed: {exc}")
             logger.exception("Classical calcification detection failed")
@@ -685,7 +674,11 @@ class MammographyCADSystem:
             for existing in kept:
                 if existing.type != detection.type:
                     continue
-                if self._overlap_ratio(existing, detection) > 0.75:
+                left = {tuple(s['center']) for s in existing.features.get('individual_calcifications', [])}
+                right = {tuple(s['center']) for s in detection.features.get('individual_calcifications', [])}
+                same_members = bool(left and right and left == right)
+                legacy_overlap = not (left and right) and self._overlap_ratio(existing, detection) > .75
+                if same_members or legacy_overlap:
                     duplicate = True
                     break
             if not duplicate:
@@ -911,9 +904,9 @@ def _resolve_spacing(image_meta: Dict[str, Any]) -> Tuple[float, float]:
     try:
         spacing = image_meta.get("pixel_spacing") or [1.0, 1.0]
         row, col = float(spacing[0]), float(spacing[1])
-        if row <= 0 or col <= 0:
-            raise ValueError("non-positive spacing")
-        if abs(row - 1.0) < 1e-9 and abs(col - 1.0) < 1e-9:
+        if not np.isfinite([row, col]).all() or row <= 0 or col <= 0:
+            raise ValueError("invalid spacing")
+        if not image_meta.get("spacing_known", (row, col) != (1., 1.)):
             # 1.0 mm/px is never a real mammography pitch: it means "unknown".
             assumed = float(getattr(Config, "ASSUMED_PIXEL_SPACING_MM", 0.05))
             return assumed, assumed

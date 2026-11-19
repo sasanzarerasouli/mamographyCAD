@@ -90,9 +90,10 @@ class DICOMHandler:
                 "accession_number": _s(getattr(ds, "AccessionNumber", "")),
             }
 
-            pixel_spacing = self._read_pixel_spacing(ds)
+            pixel_spacing = self._read_pixel_spacing(ds, default=None)
             meta["image"] = {
-                "pixel_spacing": list(pixel_spacing),
+                "pixel_spacing": list(pixel_spacing or (1., 1.)),
+                "spacing_known": pixel_spacing is not None,
                 "view_position": _s(getattr(ds, "ViewPosition", "")).upper(),
                 "laterality": _s(getattr(ds, "ImageLaterality", "")).upper(),
                 "rows": int(getattr(ds, "Rows", 0) or 0),
@@ -153,13 +154,13 @@ class DICOMHandler:
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), metadata
 
     def load_grayscale(
-        self, path: str
+        self, path: str, *, source_pixels=None
     ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
         """Load *path* as an 8-bit, display-oriented grayscale array."""
         metadata = self.extract_metadata(path)
 
         if metadata.get("source") == "dicom" or self.is_dicom(path):
-            gray = self._load_dicom_grayscale(path, metadata)
+            gray = self._load_dicom_grayscale(path, metadata, source_pixels=source_pixels)
             if gray is not None:
                 metadata["source"] = "dicom"
                 return gray, metadata
@@ -167,7 +168,7 @@ class DICOMHandler:
                 "DICOM decoding failed, falling back to raster reader: %s", path
             )
 
-        gray = self._load_raster_grayscale(path)
+        gray = self._load_raster_grayscale(path, source_pixels=source_pixels)
         if gray is not None:
             metadata.setdefault("source", "standard")
             metadata["source"] = "standard"
@@ -197,7 +198,7 @@ class DICOMHandler:
             return None
 
     @staticmethod
-    def _read_pixel_spacing(ds) -> Tuple[float, float]:
+    def _read_pixel_spacing(ds, default=(1., 1.)) -> Optional[Tuple[float, float]]:
         spacing = getattr(ds, "PixelSpacing", None)
         if spacing is None:
             # Some whole-slide style objects use ImagerPixelSpacing
@@ -206,15 +207,15 @@ class DICOMHandler:
             if spacing is not None and len(spacing) >= 2:
                 row_spacing, col_spacing = float(spacing[0]), float(spacing[1])
                 # A spacing of exactly 0 would poison every mm measurement.
-                if row_spacing <= 0 or col_spacing <= 0:
+                if not np.isfinite([row_spacing, col_spacing]).all() or row_spacing <= 0 or col_spacing <= 0:
                     raise ValueError("non-positive pixel spacing")
                 return row_spacing, col_spacing
         except (TypeError, ValueError):
             pass
-        return 1.0, 1.0
+        return default
 
     def _load_dicom_grayscale(
-        self, path: str, metadata: Dict[str, Any]
+        self, path: str, metadata: Dict[str, Any], *, source_pixels=None
     ) -> Optional[np.ndarray]:
         try:
             import pydicom
@@ -235,6 +236,7 @@ class DICOMHandler:
         ).upper() or image_meta.get("photometric_interpretation", "")
         metadata["image"]["photometric_interpretation"] = photometric
 
+        decoded = array
         if array.ndim == 3:
             # Colour (very unusual for mammography) or multi-frame: keep first
             # frame for multi-frame objects, convert colour to luminance.
@@ -249,6 +251,8 @@ class DICOMHandler:
             logger.error("Unsupported DICOM pixel array shape: %s", array.shape)
             return None
 
+        if source_pixels is not None:
+            source_pixels.append(decoded)
         gray = self._to_display_uint8(array, ds, image_meta)
 
         if photometric == "MONOCHROME1":
@@ -313,10 +317,12 @@ class DICOMHandler:
         image_meta["original_dtype"] = str(array.dtype)
         return (scaled * 255.0).round().astype(np.uint8)
 
-    def _load_raster_grayscale(self, path: str) -> Optional[np.ndarray]:
+    def _load_raster_grayscale(self, path: str, *, source_pixels=None) -> Optional[np.ndarray]:
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             return None
+        if source_pixels is not None:
+            source_pixels.append(img)
         if img.ndim == 3:
             if img.shape[2] == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)

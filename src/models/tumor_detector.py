@@ -11,13 +11,10 @@ logger = logging.getLogger("MammographyCAD")
 
 
 class TumorDetector:
-    """
-    Improved tumor detector with:
-      - More accurate segmentation masks (Otsu + morphology + active-contour refinement)
-      - Better suspicious-region localization (multi-scale blob + LoG + texture fusion)
-      - Reduced false positives (shape/texture/intensity validation + NMS)
-      - Circular boundary output (center, radius) + confidence + label
-    Interface (detect()) remains backward compatible.
+    """Compatibility facade for the primary classical mass pipeline.
+
+    Legacy rendering and private research helpers are retained for existing
+    callers; the public `detect` entry point uses `mass_pipeline`.
     """
 
     # ---------------- Labels ---------------- #
@@ -38,107 +35,13 @@ class TumorDetector:
     # ============================================================= #
     #                           MAIN API                            #
     # ============================================================= #
-    def detect(self, enhanced: np.ndarray, breast_mask: np.ndarray) -> List[Detection]:
-        detections: List[Detection] = []
+    def detect(self, enhanced: np.ndarray, breast_mask: np.ndarray, *, debug=None) -> List[Detection]:
+        """Run the classical primary detector; optionally retain localization maps."""
+        from .mass_pipeline import detect_masses
 
         if enhanced is None or breast_mask is None:
-            return detections
-
-        # اطمینان از uint8 بودن ورودی
-        if enhanced.dtype != np.uint8:
-            enhanced = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        if breast_mask.dtype != np.uint8:
-            breast_mask = (breast_mask > 0).astype(np.uint8) * 255
-
-        # پیش‌پردازش برای کاهش نویز و افزایش کنتراست محلی
-        preproc = self._preprocess(enhanced, breast_mask)
-
-        # سه استراتژی مستقل تشخیص
-        texture_regions   = self._texture_based_detection(preproc, breast_mask)
-        intensity_regions = self._intensity_based_detection(preproc, breast_mask)
-        shape_regions     = self._shape_based_detection(preproc, breast_mask)
-        blob_regions      = self._blob_based_detection(preproc, breast_mask)   # جدید
-
-        # هر کاندید به‌صورت مستقل ارزیابی می‌شود.
-        # ادغام ماسک‌ها پیش از ارزیابی باعث می‌شد یک ناحیه بزرگ (که توسط
-        # آستانه‌گذاری adaptive تولید می‌شود) کاندید صحیح تومور را ببلعد و
-        # منجر به از دست رفتن تشخیص شود؛ حذف تکراری‌ها در پایان با NMS دایره‌ای
-        # انجام می‌شود که رفتار درست‌تری دارد.
-        candidates = (
-            texture_regions + intensity_regions + shape_regions + blob_regions
-        )
-
-        max_area = enhanced.shape[0] * enhanced.shape[1] * self.max_tumor_area_ratio
-
-        for region in candidates:
-            # فیلتر اندازه غیرمنطقی
-            if region['features'].get('area', 0) > max_area:
-                continue
-
-            # پالایش ماسک (دقت بیشتر) و استخراج دایره محیطی
-            refined_mask = self._refine_mask(region['mask'], enhanced, breast_mask)
-            if refined_mask is None or cv2.countNonZero(refined_mask) < self.min_tumor_area:
-                continue
-
-            center, radius = self._fit_circle(refined_mask)
-            if radius < 5:
-                continue
-
-            # غربالگری برجستگی: ناحیه باید از بافت اطراف خود به‌طور معنی‌داری
-            # روشن‌تر باشد، وگرنه بافت طبیعی است (کاهش False Positive)
-            prominence, ring_density = self._prominence(enhanced, refined_mask, radius)
-            if prominence < self.min_prominence:
-                continue
-            if ring_density > self.max_ring_density:
-                continue
-
-            # ارزیابی چند-فاکتوری (کاهش FP)
-            confidence = self._evaluate_region(region, enhanced, refined_mask, radius)
-            confidence = float(np.clip(confidence + self._prominence_bonus(prominence), 0.0, 1.0))
-
-            if confidence >= self.confirmed_threshold:
-                detection_type = DetectionType.TUMOR_CONFIRMED
-                label = self.LABEL_MALIGNANT
-            elif confidence >= self.suspicious_threshold:
-                detection_type = DetectionType.TUMOR_SUSPICIOUS
-                label = self.LABEL_SUSPICIOUS
-            else:
-                continue  # حذف تشخیص‌های ضعیف
-
-            # بازسازی bbox براساس ماسک پالایش‌شده
-            ys, xs = np.where(refined_mask > 0)
-            x_min, y_min = int(xs.min()), int(ys.min())
-            x_max, y_max = int(xs.max()), int(ys.max())
-            bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
-
-            features = dict(region['features'])
-            features.update({
-                'center': center,
-                'radius': int(radius),
-                'prominence': float(prominence),
-                'ring_density': float(ring_density),
-                'label':  label,
-                'confidence': float(confidence),
-            })
-
-            detection = Detection(
-                type=detection_type,
-                location=center,
-                bbox=bbox,
-                mask=refined_mask,
-                confidence=float(confidence),
-                features=features,
-            )
-            detections.append(detection)
-
-        # NMS نهایی روی دایره‌ها
-        detections = self._circle_nms(detections)
-        # سقف خروجی: قوی‌ترین موارد نگه داشته می‌شوند
-        if len(detections) > self.max_detections:
-            detections.sort(key=lambda d: d.confidence, reverse=True)
-            detections = detections[: self.max_detections]
-        logger.info("TumorDetector produced %d detections", len(detections))
-        return detections
+            return []
+        return detect_masses(enhanced, breast_mask, debug=debug)
 
     # ============================================================= #
     #                        PREPROCESSING                          #

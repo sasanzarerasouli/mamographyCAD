@@ -36,6 +36,10 @@ class ResultVisualizer:
         self.show_arrows: bool = True
         self.show_masks: bool = True
         self.show_bboxes: bool = True
+        self.show_confidence: bool = True
+        self.show_cluster_outlines: bool = True
+        self.show_calc_masks: bool = True
+        self.show_calc_labels: bool = True
         self.show_centers: bool = True
         #: labels are drawn for at most this many findings (highest confidence
         #: first); boxes/markers are always drawn for every finding
@@ -88,7 +92,7 @@ class ResultVisualizer:
             result = self._draw_density_heatmap(result, density_map)
 
         # 2. کشیدن اورلی سگمنتیشن (ماسک‌ها)
-        if self.show_masks:
+        if self.show_masks or self.show_calc_masks:
             result = self._draw_segmentation_overlays(result, detections, highlight_id)
 
         # 3. کشیدن مرز پکتورال
@@ -200,18 +204,8 @@ class ResultVisualizer:
             if detection.mask is None or detection.mask.size == 0:
                 continue
 
-            # بررسی نمایش تومور
-            if not self.show_tumors and detection.type in (
-                DetectionType.TUMOR_CONFIRMED,
-                DetectionType.TUMOR_SUSPICIOUS,
-            ):
-                continue
-
-            # بررسی نمایش کلسیفیکاسیون
-            if not self.show_calcifications and detection.type in (
-                DetectionType.MICROCALCIFICATION,
-                DetectionType.MACROCALCIFICATION,
-            ):
+            is_calc = detection.type in (DetectionType.MICROCALCIFICATION, DetectionType.MACROCALCIFICATION)
+            if (is_calc and not self.show_calc_masks) or (not is_calc and not self.show_masks):
                 continue
 
             color = self.COLORS.get(detection.type, (255, 255, 255))
@@ -338,19 +332,8 @@ class ResultVisualizer:
             if detection.is_ignored:
                 continue
 
-            # فیلتر تومورها
-            if not self.show_tumors and detection.type in (
-                DetectionType.TUMOR_CONFIRMED,
-                DetectionType.TUMOR_SUSPICIOUS,
-            ):
-                continue
-
-            # فیلتر کلسیفیکاسیون‌ها
-            if not self.show_calcifications and detection.type in (
-                DetectionType.MICROCALCIFICATION,
-                DetectionType.MACROCALCIFICATION,
-            ):
-                continue
+            is_calc = detection.type in (DetectionType.MICROCALCIFICATION, DetectionType.MACROCALCIFICATION)
+            members = detection.features.get('individual_calcifications', [])
 
             color = self.COLORS.get(detection.type, (255, 255, 255))
 
@@ -360,10 +343,10 @@ class ResultVisualizer:
                 thickness = self.line_thickness + 2
 
             # 1. کشیدن باکس
-            if self.show_bboxes and detection.bbox:
+            if not is_calc and self.show_tumors and self.show_bboxes and detection.bbox:
                 x, y, w, h = detection.bbox
                 x0, y0 = int(x), int(y)
-                x1, y1 = int(x + w), int(y + h)
+                x1, y1 = int(x + w - 1), int(y + h - 1)
                 cv2.rectangle(result, (x0, y0), (x1, y1), color, thickness, cv2.LINE_AA)
 
             # 2. کشیدن مرکز و دایره‌های تومور
@@ -372,11 +355,11 @@ class ResultVisualizer:
                 cx_i, cy_i = int(cx), int(cy)
 
                 # کشیدن دایره مرکز
-                if self.show_centers:
+                if self.show_centers and not is_calc and self.show_tumors and self.show_bboxes:
                     cv2.circle(result, (cx_i, cy_i), 5, color, -1, cv2.LINE_AA)
 
                 # کشیدن فلش برای اشاره
-                if self.show_arrows:
+                if self.show_arrows and not is_calc:
                     arrow_len = 40
                     # فلش رو به بالا
                     start_point = (cx_i, cy_i - arrow_len)
@@ -385,25 +368,29 @@ class ResultVisualizer:
                         result, start_point, end_point, color, thickness, cv2.LINE_AA
                     )
 
-                # کشیدن دایره‌های تومور (برای تومورها)
-                if self.show_tumors and detection.type in (
-                    DetectionType.TUMOR_CONFIRMED,
-                    DetectionType.TUMOR_SUSPICIOUS,
-                ):
-                    self._draw_tumor_circles(result, detection, color, thickness)
-
-            # 3. کشیدن مارکرهای کلسیفیکاسیون
-            if detection.type in (
-                DetectionType.MICROCALCIFICATION,
-                DetectionType.MACROCALCIFICATION,
-            ):
-                self._draw_calcification_markers(result, detection, color, thickness)
-
-            # 4. کشیدن لیبل‌ها
-            if self.show_labels and detection.location and detection.id in labelled_ids:
+            if is_calc and self.show_cluster_outlines and len(members) >= 2:
+                points = np.asarray([m['center'] for m in members], dtype=np.int32)
+                hull = cv2.convexHull(points)
+                cv2.polylines(result, [hull], len(hull) >= 3, color, thickness, cv2.LINE_AA)
+            if is_calc and self.show_calcifications:
+                if members:
+                    for member in members:
+                        center = tuple(map(int, member['center']))
+                        cv2.drawMarker(result, center, color, cv2.MARKER_CROSS, self.calc_marker_size*2, 1)
+                else:
+                    self._draw_calcification_markers(result, detection, color, thickness)
+            if is_calc and self.show_calc_masks:
+                for member in members:
+                    points = np.asarray(member.get('pixels_xy', []), dtype=int)
+                    if points.size:
+                        x, y = points.T
+                        keep = (x >= 0) & (x < result.shape[1]) & (y >= 0) & (y < result.shape[0])
+                        result[y[keep], x[keep]] = color
+            labels = self.show_calc_labels if is_calc else self.show_labels
+            if (labels or self.show_confidence) and detection.location and detection.id in labelled_ids:
                 cx, cy = detection.location
                 cx_i, cy_i = int(cx), int(cy)
-                self._draw_label(result, detection, cx_i, cy_i, color)
+                self._draw_label(result, detection, cx_i, cy_i, color, show_label=labels)
 
         return result
 
@@ -522,6 +509,7 @@ class ResultVisualizer:
         cx: int,
         cy: int,
         color: tuple[int, int, int],
+        *, show_label: Optional[bool] = None,
     ) -> None:
         """
         Draw detection label.
@@ -534,9 +522,11 @@ class ResultVisualizer:
             color: Text color
         """
         # ساخت متن
-        type_name = detection.type.value.replace("_", " ").title()
-        conf_text = f"{detection.confidence:.0%}"
-        label = f"{type_name} ({conf_text})"
+        type_name = detection.features.get('label') or detection.type.value.replace('_', ' ').title()
+        score_kind = 'score' if detection.features.get('source') != 'deep' else 'model score'
+        score = f'{score_kind} {detection.confidence:.2f}'
+        show_label = self.show_labels if show_label is None else show_label
+        label = ' | '.join(part for part in (type_name if show_label else '', score if self.show_confidence else '') if part)
 
         # موقعیت متن (بالای فلش یا کنار مرکز)
         text_pos = (cx + 10, cy - 15)

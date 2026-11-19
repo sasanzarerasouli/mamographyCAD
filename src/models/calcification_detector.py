@@ -5,6 +5,7 @@ from sklearn.cluster import DBSCAN
 from scipy import ndimage
 import logging
 
+from config import Config
 from ..core.detection_types import Detection, DetectionType
 
 logger = logging.getLogger("MammographyCAD")
@@ -40,24 +41,31 @@ class CalcificationDetector:
         self.dbscan_min_samples = 2  # Lower threshold to catch small clusters
         self.dbscan_eps_macro = 80  # For macro grouping
     
-    def detect(self, enhanced: np.ndarray, breast_mask: np.ndarray) -> List[Detection]:
+    def detect(self, enhanced: np.ndarray, breast_mask: np.ndarray, *, spacing=None) -> List[Detection]:
         detections = []
 
         # Exclude the skin line: the mask boundary is an artificial high-contrast
         # ramp that is otherwise detected as calcification-like specks.
-        breast_mask = self._erode_skin_line(breast_mask)
+        tissue = breast_mask > 0
+        core = self._erode_skin_line(breast_mask) > 0
 
         # Multi-scale preprocessing
-        preprocessed = self._multiscale_preprocess(enhanced, breast_mask)
+        preprocessed = self._multiscale_preprocess(enhanced, tissue.astype(np.uint8) * 255)
         
         # Multi-threshold detection for higher sensitivity
         bright_spots = self._detect_bright_spots_multithreshold(preprocessed, enhanced)
         
+        seed_mask, responses = self._hysteresis(enhanced, tissue, core)
+        bright_spots = self._deduplicate_spots(bright_spots + self._extract_spots_from_threshold(
+            seed_mask, responses, enhanced, preserve_pixels=True))
+        bright_spots = [s for s in bright_spots if tissue[s['center'][1], s['center'][0]]
+                        and (core[s['center'][1], s['center'][0]] or s['prominence'] >= 2*self.min_prominence)]
+
         # Filter by size and shape
         valid_spots = self._filter_spots(bright_spots)
         
         # Classify and cluster
-        micro_clusters, macro_spots = self._classify_and_cluster(valid_spots, enhanced, breast_mask)
+        micro_clusters, macro_spots = self._classify_and_cluster(valid_spots, enhanced, breast_mask, spacing=spacing)
         
         # Build detections
         for cluster in micro_clusters:
@@ -109,6 +117,36 @@ class CalcificationDetector:
             return (breast_mask > 0).astype(np.uint8) * 255
         return eroded
 
+    @staticmethod
+    def _hysteresis(enhanced, tissue, core):
+        """Full-resolution compact-scale evidence with connected weak support."""
+        image = enhanced.astype(np.float32)
+        window = (Config.CALC_SPOT_LOCAL_WINDOW,)*2
+        background = cv2.medianBlur(enhanced, 5).astype(np.float32)
+        residual = image - background
+        local_mad = cv2.medianBlur(np.abs(residual).astype(np.uint8), 5).astype(np.float32)
+        noise = 3 + 1.4826 * cv2.blur(local_mad, window)
+        response = np.zeros_like(image)
+        for sigma in Config.CALC_SPOT_SIGMAS:
+            narrow = cv2.GaussianBlur(image, (0, 0), sigma)
+            wide = cv2.GaussianBlur(image, (0, 0), 1.6*sigma)
+            dog = narrow - wide
+            log = -sigma*sigma * cv2.Laplacian(narrow, cv2.CV_32F)
+            np.maximum(response, (2*dog + log) / noise, out=response)
+        top = np.zeros_like(enhanced)
+        for k in Config.CALC_SPOT_TOPHAT:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
+            np.maximum(top, cv2.morphologyEx(enhanced, cv2.MORPH_TOPHAT, kernel), out=top)
+        score = .50 * response + .30 * top/noise + .20*np.maximum(residual,0)/noise
+        score[~core] *= .65
+        strong = tissue & (score >= Config.CALC_SPOT_SEED)
+        weak = tissue & (score >= Config.CALC_SPOT_GROW)
+        _, labels = cv2.connectedComponents(weak.astype(np.uint8), connectivity=8)
+        selected = np.zeros(labels.max()+1, bool)
+        selected[labels[strong]] = True
+        selected[0] = False
+        return selected[labels].astype(np.uint8)*255, np.clip(score*30,0,255).astype(np.uint8)
+
     # -------------------- Preprocessing --------------------
     
     def _multiscale_preprocess(self, enhanced: np.ndarray, breast_mask: np.ndarray) -> np.ndarray:
@@ -153,7 +191,7 @@ class CalcificationDetector:
         return unique_spots
     
     def _extract_spots_from_threshold(self, thresh: np.ndarray, preprocessed: np.ndarray,
-                                      enhanced: np.ndarray) -> List[Dict]:
+                                      enhanced: np.ndarray, *, preserve_pixels=False) -> List[Dict]:
         """Extract bright-spot candidates from a binary mask.
 
         Implementation notes
@@ -167,7 +205,8 @@ class CalcificationDetector:
         """
         # Morphological opening to remove single-pixel noise
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        if not preserve_pixels:
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
         height, width = thresh.shape[:2]
         max_area = float(self.macro_size_range[1] ** 2 * 1.5)
@@ -413,7 +452,7 @@ class CalcificationDetector:
             if spot.get('prominence', 0.0) < self.min_prominence:
                 continue
             # Microcalcifications are compact: reject elongated specks
-            if spot['area'] <= 25 and spot['circularity'] < 0.25:
+            if 3 <= spot['area'] <= 25 and spot['circularity'] < 0.25:
                 continue
             # A spot embedded in tissue of similar brightness is parenchyma
             if spot.get('ring_density', 0.0) > self.max_ring_density:
@@ -449,7 +488,7 @@ class CalcificationDetector:
     # -------------------- Classification & Clustering --------------------
     
     def _classify_and_cluster(self, spots: List[Dict], enhanced: np.ndarray,
-                              breast_mask: np.ndarray) -> Tuple[List[Dict], List[Dict]]:
+                              breast_mask: np.ndarray, *, spacing=None) -> Tuple[List[Dict], List[Dict]]:
         micro_candidates, macro_candidates = [], []
         
         for spot in spots:
@@ -466,20 +505,22 @@ class CalcificationDetector:
                     else:
                         macro_candidates.append(spot)
         
-        micro_clusters = self._cluster_microcalcifications(micro_candidates, enhanced)
+        micro_clusters = self._cluster_microcalcifications(micro_candidates, enhanced, spacing=spacing)
         macro_spots = self._process_macros(macro_candidates, enhanced)
         
         return micro_clusters, macro_spots
     
     def _cluster_microcalcifications(self, micro_candidates: List[Dict],
-                                     enhanced: np.ndarray) -> List[Dict]:
+                                     enhanced: np.ndarray, *, spacing=None) -> List[Dict]:
         if not micro_candidates:
             return []
         
         points = np.array([spot['center'] for spot in micro_candidates], dtype=np.float64)
         
-        # Adaptive eps based on local density
-        eps = self._adaptive_eps(points, base_eps=self.dbscan_eps)
+        scale = np.array(spacing[::-1] if spacing is not None else (1.,1.))
+        points *= scale
+        eps = Config.CALC_DBSCAN_EPS_MM if spacing is not None else self._adaptive_eps(points, base_eps=self.dbscan_eps)
+        max_extent = Config.CALC_DBSCAN_MAX_EXTENT_MM if spacing is not None else self.max_cluster_extent_px
         
         clustering = DBSCAN(eps=eps, min_samples=self.dbscan_min_samples).fit(points)
         labels = clustering.labels_
@@ -505,7 +546,7 @@ class CalcificationDetector:
                 if not self._is_strong_isolated_micro(cluster_spots[0]):
                     continue
 
-            for group in self._split_by_extent(cluster_spots, eps):
+            for group in self._split_by_extent(cluster_spots, eps, scale=scale, max_extent=max_extent):
                 if len(group) < 2 and not self._is_strong_isolated_micro(group[0]):
                     continue
                 if self._mean_prominence(group) < self.min_cluster_prominence:
@@ -513,10 +554,20 @@ class CalcificationDetector:
                 clusters.append(self._build_micro_cluster(group, enhanced))
         
         # Merge clusters that are very close
-        clusters = self._merge_nearby_clusters(clusters, distance_threshold=eps * 1.5)
+        # Keep isolated spots separate, and do not merge split groups back into a chain.
+        for cluster in clusters:
+            members = cluster['features']['individual_calcifications']
+            coords = np.array([m['center'] for m in members]) * scale
+            d = np.linalg.norm(coords[:,None] - coords[None,:], axis=2)[np.triu_indices(len(coords),1)]
+            area = cluster['features']['cluster_area'] * float(np.prod(scale))
+            cluster['features'].update(distance_unit='mm' if spacing is not None else 'px',
+                                       cluster_extent_area=float(area),
+                                       cluster_diameter=float(d.max()) if len(d) else 0.,
+                                       mean_inter_calc_distance=float(d.mean()) if len(d) else 0.,
+                                       cluster_density=float(len(coords)/area))
         return clusters
 
-    def _split_by_extent(self, spots: List[Dict], eps: float) -> List[List[Dict]]:
+    def _split_by_extent(self, spots: List[Dict], eps: float, *, scale=(1.,1.), max_extent=None) -> List[List[Dict]]:
         """Split a chained DBSCAN group into spatially compact clusters.
 
         DBSCAN links points transitively, so on a speckled background a single
@@ -529,12 +580,13 @@ class CalcificationDetector:
         if len(spots) == 1:
             return [spots]
 
-        points = np.array([s['center'] for s in spots], dtype=np.float64)
+        max_extent = self.max_cluster_extent_px if max_extent is None else max_extent
+        points = np.array([s['center'] for s in spots], dtype=np.float64) * scale
         if len(spots) <= self.cluster_max_spots:
             extent = float(
                 np.sqrt(((points.max(axis=0) - points.min(axis=0)) ** 2).sum())
             )
-            if extent <= self.max_cluster_extent_px:
+            if extent <= max_extent:
                 return [spots]
 
         remaining = sorted(spots, key=lambda s: s['max_intensity'], reverse=True)
@@ -542,7 +594,7 @@ class CalcificationDetector:
         while remaining:
             seed = remaining.pop(0)
             group = [seed]
-            group_points = [np.array(seed['center'], dtype=np.float64)]
+            group_points = [np.array(seed['center'], dtype=np.float64) * scale]
             grew = True
             while grew:
                 grew = False
@@ -550,12 +602,12 @@ class CalcificationDetector:
                 for candidate in list(remaining):
                     if len(group) >= self.cluster_max_spots:
                         break
-                    point = np.array(candidate['center'], dtype=np.float64)
+                    point = np.array(candidate['center'], dtype=np.float64) * scale
                     if np.linalg.norm(point - centroid) > eps:
                         continue
                     all_points = np.vstack([group_points, point[None, :]])
                     span = all_points.max(axis=0) - all_points.min(axis=0)
-                    if float(np.hypot(span[0], span[1])) > self.max_cluster_extent_px:
+                    if float(np.hypot(span[0], span[1])) > max_extent:
                         continue
                     group.append(candidate)
                     group_points.append(point)
@@ -643,6 +695,11 @@ class CalcificationDetector:
             'individual_calcifications': [
                 {
                     'center': [float(s['center'][0]), float(s['center'][1])],
+                    'bbox_px': list(s['bbox']),
+                    'pixels_xy': [
+                        [int(s['bbox'][0] + x), int(s['bbox'][1] + y)]
+                        for y, x in zip(*np.nonzero(s['component'][2]))
+                    ] if s.get('component') is not None else [],
                     'area': float(s.get('area', 0.0)),
                     'equivalent_diameter': float(s.get('equivalent_diameter', 0.0)),
                     'circularity': float(s.get('circularity', 0.0)),
@@ -711,6 +768,13 @@ class CalcificationDetector:
             
             features = {
                 'area': spot['area'],
+                'individual_calcifications': [{
+                    'center': list(spot['center']),
+                    'pixels_xy': [[int(x+i), int(y+j)] for j,i in zip(*np.nonzero(spot['component'][2]))]
+                    if spot.get('component') is not None else [],
+                    'area': spot['area'],
+                    'equivalent_diameter': spot['equivalent_diameter'],
+                }],
                 'circularity': spot['circularity'],
                 'equivalent_diameter': spot['equivalent_diameter'],
                 'mean_intensity': spot['mean_intensity'],

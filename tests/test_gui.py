@@ -193,3 +193,55 @@ def test_batch_mode_processes_a_folder(window, tmp_path, phantom_path):
     assert window.batch_failed == 0, window.batch_failures
     reports = [name for name in os.listdir(out_dir) if name.endswith(".html")]
     assert len(reports) == 2, reports
+
+
+def test_mask_correction_mouse_undo_restore_and_report(window, analysis, tmp_path):
+    from copy import deepcopy
+    from PyQt6.QtCore import QPointF, Qt
+    from PyQt6.QtTest import QTest
+    from src.reporting.report_builder import ReportBuilder
+
+    result = deepcopy(analysis[0])
+    window.on_analysis_ready(result)
+    assert 'Mass candidate stage complete' in window.activity_log.toPlainText() or 'Analysis returned' in window.activity_log.toPlainText()
+    mass = next(d for d in result.detections if d.mask is not None and 'segmentation_confidence' in d.features)
+    window.on_detection_clicked(mass.id)
+    window.check_show_original.setChecked(True)
+    assert not window.lbl_original.detections
+    window.check_show_original.setChecked(False)
+    auto = mass.mask.copy()
+    original = result.original.copy()
+    y, x = np.argwhere(auto > 0)[len(np.argwhere(auto > 0))//2]
+    window.mask_mode.setCurrentIndex(2)
+    widget = window.lbl_original
+    widget.fit_to_window()
+    click = widget._image_to_screen_coords(QPointF(x+.5,y+.5)).toPoint()
+    assert widget.rect().contains(click)
+    QTest.mouseClick(widget, Qt.MouseButton.LeftButton, pos=click)
+    assert np.count_nonzero(mass.mask) < np.count_nonzero(auto)
+    assert np.array_equal(mass.automatic_mask, auto)
+    assert np.array_equal(result.original, original)
+    assert mass.features['measurement']['area_px'] == np.count_nonzero(mass.mask)
+    builder = ReportBuilder(str(tmp_path))
+    assert 'manual correction' in builder.build_html(result, include_images=False)
+    target = tmp_path / 'research.pdf'
+    builder.save_pdf(result, str(target))
+    assert target.read_bytes().startswith(b'%PDF')
+    window._undo_mask_edit()
+    assert np.array_equal(mass.mask, auto)
+    QTest.mouseClick(widget, Qt.MouseButton.LeftButton, pos=click)
+    window._restore_automatic_mask()
+    assert np.array_equal(mass.mask, auto)
+    window.mask_mode.setCurrentIndex(0)
+
+
+def test_docx_research_export(analysis, tmp_path):
+    docx = pytest.importorskip('docx')
+    from src.reporting.report_builder import ReportBuilder
+
+    path = tmp_path / 'research.docx'
+    ReportBuilder(str(tmp_path)).save_docx(analysis[0], str(path))
+    content = docx.Document(path)
+    assert any('independent diagnostic validity' in paragraph.text for paragraph in content.paragraphs)
+    assert any('evidence score' in paragraph.text for paragraph in content.paragraphs)
+    assert len(content.inline_shapes) == 1

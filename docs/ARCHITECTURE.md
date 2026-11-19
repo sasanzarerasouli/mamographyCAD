@@ -4,7 +4,7 @@
 main.py
 └── src/ui/main_window.py  (MammographyCADApp, QMainWindow)
     ├── 5 image tabs    Original/Overlay · Enhanced · Mask · Density · Heatmap
-    ├── side tabs       Results · Clinical · Lesion detail · Settings · Models/Info
+    ├── side tabs       Results · Clinical · Lesion detail · Settings · Models/Info · Log management
     ├── CADWorker (QThread)        → src/core/cad_system.py
     ├── BatchProcessor (QThread)   → src/core/batch_processor.py
     └── ReportBuilder              → src/reporting/report_builder.py
@@ -22,12 +22,16 @@ main.py
 3. **quality analysis** – exposure, contrast, coverage; insufficient coverage
    raises a warning that flows into BI-RADS 0 handling.
 4. **segmentation refinement** – `segmentation_pipeline.py`.
-5. **mass detection** – deep backend when a usable checkpoint exists, else
-   multi-stage classical detector (LoG/DoG candidates → per-candidate
-   evaluation → contour, ROI statistics, spiculation).
+5. **mass detection** – always classical. Five scale-normalized responses →
+   per-scale spatial peaks → original-grid ROI segmentation by FCM, seeded
+   gradient watershed and adaptive Gaussian residual → majority vote, component
+   association and agreement flags. See `docs/RESEARCH_UPGRADE.md`.
 6. **calcification detection** – deep backend (overlapping 640 px tiles, 30 %
    overlap, multi-scale, class-aware NMS) or classical ring/intensity spot
    detector with micro/macro separation and vectorised clustering.
+   The default is classical, with full-grid compact-scale hysteresis and
+   spacing-aware microcalcification grouping; deep calcification requires
+   explicit local trust and opt-in.
 7. **characterisation** – ACR shape/margin/density/orientation per mass;
    morphology/distribution/cluster analysis for calcifications.
 8. **measurements** – px and mm values (spacing-aware).
@@ -43,7 +47,7 @@ crash.
 
 ## Threading
 
-* `CADWorker(QThread)` emits `progress(int, str)`, `result_ready(AnalysisResult)`,
+* `CADWorker(QThread)` emits `progress(int)`, `result_ready(AnalysisResult)`,
   the legacy 6-argument `finished`, `error(str)`, `cancelled`. `cancel()` is
   checked at every progress callback and raises an internal `_Cancelled`.
 * `BatchProcessor(QThread)` emits `progress(int,int,str)`, `file_done(path,
@@ -66,6 +70,7 @@ code and tests since `QLabel.pixmap()` is meaningless for a paint-based widget.
 
 `ReportBuilder` writes `{root}.json` and a **self-contained** `{root}.html`
 (base64 PNG overlay/enhanced/mask/heatmap, no external resources). The report
+also offers GUI PDF and optional DOCX export. The HTML report
 contains the provenance table (file, SHA-256 of the model, backend, spacing
 basis, timestamps), the acquisition parameters, every finding with its
 descriptors and measurements, the BI-RADS estimate with evidence and management,

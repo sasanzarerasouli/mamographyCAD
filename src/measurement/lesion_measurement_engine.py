@@ -255,7 +255,7 @@ class LesionMeasurementEngine:
 
         # ---- compute everything from contour ----
         if contour is not None:
-            area_px      = float(cv2.contourArea(contour))
+            area_px = float(np.count_nonzero(detection.mask) if detection.mask is not None else cv2.contourArea(contour))
             perimeter_px = float(cv2.arcLength(contour, True))
 
             hull = cv2.convexHull(contour)

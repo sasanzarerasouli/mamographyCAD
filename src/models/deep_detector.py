@@ -404,7 +404,7 @@ def get_backend(
 ) -> Optional[DeepDetectionBackend]:
     """Return a loaded backend for *task*, or ``None`` when unavailable."""
     task = task.lower()
-    if Config.DETECTION_BACKEND == "off":
+    if Config.DETECTION_BACKEND == "off" or not Config.TRUST_LOCAL_CHECKPOINTS:
         return None
 
     registry = registry or ModelRegistry()
@@ -444,7 +444,8 @@ def backend_status() -> Dict[str, Any]:
         "mass": {"backend": "classical", "model": None, "reason": ""},
         "calcification": {"backend": "classical", "model": None, "reason": ""},
     }
-    for task in ("mass", "calcification"):
+    status["mass"]["reason"] = "Primary mass detection is always classical; comparison is not enabled."
+    for task in ("calcification",):
         backend = get_backend(task, registry)
         if backend is not None:
             status[task] = {

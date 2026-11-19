@@ -27,11 +27,11 @@ class MammographyPreprocessor:
     #  Loading                                                           #
     # ------------------------------------------------------------------ #
     @staticmethod
-    def load_image(img_path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def load_image(img_path: str, *, source_pixels=None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Load a mammogram as ``(gray8 display image, metadata)``."""
         if img_path is None or not os.path.exists(img_path):
             raise FileNotFoundError(f"Cannot load image: {img_path}")
-        gray, metadata = DICOMHandler().load_grayscale(img_path)
+        gray, metadata = DICOMHandler().load_grayscale(img_path, source_pixels=source_pixels)
         if gray is None:
             raise FileNotFoundError(f"Cannot load image: {img_path}")
         gray = MammographyPreprocessor.ensure_display_polarity(gray)

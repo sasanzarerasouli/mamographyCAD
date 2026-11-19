@@ -1,69 +1,24 @@
-# Digital Eye checkpoints — analysis status
+# Digital Eye checkpoint inventory
 
-## What was requested
+At the pinned source revision `1a146a1218b7302a53de8178366cbe9629dd289a`, all
+three files existed under `model/digital_eye`. This supersedes the earlier
+source-only inventory in this document. No weights were modified.
 
-Inspect the three pretrained YOLO checkpoints expected in `model/digital_eye/`
-and report their architecture, class vocabulary, input requirements,
-compatibility with this code base, and their real capabilities; reuse them for
-mass detection **only** if justified; never assume calcification support; never
-overwrite the weights.
+| File | Bytes (decimal MB) | SHA-256 |
+|---|---:|---|
+| `yolo11_n.pt` | 5.44 MB | `4c6ed69c85775bfe7642a428489fc0a90f53cb3ac7b164eb7da7220ef9549a14` |
+| `yolo11_s.pt` | 19.15 MB | `4d4ff958accc0c165a51cd6a5fd39962cefb05dca15c7302e81d790d60cfe758` |
+| `yolo11_m.pt` | 40.48 MB | `f67ef4e01f90c159d995653064e756a466fa6302f727772d3b9774f19824960a` |
 
-## What was actually found
+`python -m tools.inspect_models` identified Torch pickle archives but did not
+extract a verified class vocabulary or input size. Filename labels do not prove
+architecture, training data, licensing terms for weights, or suitability. Torch,
+Ultralytics and ONNX Runtime were not installed in the test sandbox. No model
+was deserialized or run, and no comparison display was enabled. No external
+reference repository was used as application source.
 
-```
-$ ls model/digital_eye
-ls: cannot access 'model/digital_eye': No such file or directory
-```
-
-The cloned repository contains application source only: `main.py`, `config.py`,
-`src/**`, a one-line `README.md`, `LICENSE` and one screenshot. There is **no
-`model/` directory, no `*.pt` / `*.pth` / `*.onnx` / `*.engine` file and no
-dataset** anywhere in the tree.
-
-Consequences, stated without hedging:
-
-* The three checkpoints **could not be analysed**. No architecture, class list,
-  input size or capability is reported for them, because inventing those values
-  would be fabrication.
-* **No checkpoint was reused.** `python -m tools.inspect_models` reports
-  `Checkpoints: 0` and the application runs its classical detectors, flagged
-  `backend: classical` in the GUI and `unvalidated_classical_fallback` in every
-  exported report.
-* No weight file was created, renamed, moved or overwritten: the inspection
-  path opens files read-only and only ever reads bytes to compute a SHA-256.
-
-## How to run the inspection on the machine that has the weights
-
-```bash
-# copy the three checkpoints into model/digital_eye/ first (read-only for the app)
-python -m tools.inspect_models                       # human readable
-python -m tools.inspect_models --json > models.json  # for the thesis appendix
-```
-
-For every file the tool prints the path, size, SHA-256, detected format, task,
-framework, class names read from the checkpoint, declared input size, inspection
-method (`torch` = authoritative, `header` = heuristic because torch is not
-installed), usability and any issues. With torch installed the same metadata is
-read through `torch.load(..., weights_only=False)` on a **copy-free read-only**
-path; without torch only the zip/pickle header is parsed and the output says so.
-
-## Decision rules implemented for the digital-eye checkpoints
-
-Encoded in `src/models/model_registry.py` + `src/models/deep_detector.py`:
-
-1. `ModelRegistry.discover()` scans `model/mass`, `model/calcification`,
-   `model/digital_eye`, `model` (and any `CAD_MODEL_DIR`), computes SHA-256 and
-   inspects each file.
-2. `select_for("mass")` / `select_for("calcification")` only accept a
-   checkpoint whose class names, **as stored in the file**, contain a matching
-   class (e.g. `mass`, `tumor`, `lesion` for mass; `calc*` for calcification).
-   A generic `person/car/...` COCO vocabulary matches nothing, so such a
-   checkpoint is excluded instead of producing nonsense detections.
-3. A checkpoint that declares no class names is reported `usable: false` with
-   the issue `class names unknown` — the vocabulary is never guessed.
-4. If both tasks resolve to no usable checkpoint, the classical detectors run
-   and the backend is reported as classical/unvalidated.
-
-With that rule set, the only scenario in which a digital-eye checkpoint is used
-for masses is the one the thesis allows: the checkpoint's own metadata names a
-mass/tumour class. Anything else (a COCO YOLO used as a "detector") is refused.
+The application inventories checkpoints without pickle deserialization by
+default. `CAD_TRUST_LOCAL_CHECKPOINTS=1` opts into existing trusted-local
+inspection paths; only use it for checkpoints whose origin and integrity you
+have independently verified. It is not required for CPU classical processing.
+The clinical-style mass pipeline never invokes a YOLO model.

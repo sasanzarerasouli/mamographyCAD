@@ -30,3 +30,7 @@ class Detection:
     risk_scores: Dict = field(default_factory=dict)
     uncertainty: float = 0.0
     reliability: float = 0.0
+    # ROI-local research masks (FCM, gradient, Gaussian); not serialized as features.
+    segmentation_hypotheses: Tuple = field(default_factory=tuple, repr=False, compare=False)
+    segmentation_origin: Optional[Tuple[int, int]] = None
+    automatic_mask: Optional["np.ndarray"] = field(default=None, repr=False, compare=False)

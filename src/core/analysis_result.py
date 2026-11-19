@@ -58,6 +58,8 @@ class AnalysisResult:
     warnings: List[str] = field(default_factory=list)
     image_metadata: Optional[Dict[str, Any]] = None
 
+    source_pixels: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+
     def to_legacy_tuple(self):
         """Backward-compatible return format for existing UI/worker."""
         return (

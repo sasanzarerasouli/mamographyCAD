@@ -192,7 +192,7 @@ class ModelRegistry:
             return info
 
         info.file_format = self._detect_format(path)
-        with_torch = runtime_status()["torch"]
+        with_torch = Config.TRUST_LOCAL_CHECKPOINTS and runtime_status()["torch"]
 
         if info.file_format in ("ultralytics_yolo", "torchscript", "torch_pickle"):
             if with_torch:

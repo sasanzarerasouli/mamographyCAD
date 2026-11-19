@@ -96,3 +96,20 @@ def test_fallback_for_non_dicom(tmp_path):
     cv2.imwrite(path, np.full((40, 40), 120, np.uint8))
     gray, metadata = DICOMHandler().load_grayscale(path)
     assert gray is not None and metadata["source"] == "standard"
+
+
+def test_full_pipeline_keeps_raw_dicom_and_detects_anisotropic_spacing(tmp_path):
+    from src.core.cad_system import MammographyCADSystem
+
+    array = np.tile(np.arange(128, dtype=np.uint16) * 31, (128, 1))
+    path = _write_dicom(str(tmp_path / 'full.dcm'), array, spacing=(.05, .11))
+    before = (tmp_path / 'full.dcm').read_bytes()
+    result = MammographyCADSystem().analyze(path)
+    assert result.image_metadata['spacing_known']
+    assert result.image_metadata['pixel_spacing'] == [.05, .11]
+    assert result.source_pixels.dtype == np.uint16
+    assert np.array_equal(result.source_pixels, array)
+    assert not result.source_pixels.flags.writeable
+    assert result.original.dtype == np.uint8
+    assert 'source_pixels' not in result.to_dict()
+    assert (tmp_path / 'full.dcm').read_bytes() == before

@@ -12,6 +12,7 @@ if a stage was skipped the panel says so explicitly instead of showing a void.
 """
 import logging
 import os
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import cv2
@@ -98,6 +99,7 @@ class MammographyCADApp(QMainWindow):
         self.worker: Optional[CADWorker] = None
         self.batch_worker: Optional[BatchProcessor] = None
         self.selected_detection_id: Optional[int] = None
+        self._mask_undo = None
         self.batch_running = False
         self.batch_ok = 0
         self.batch_failed = 0
@@ -127,6 +129,7 @@ class MammographyCADApp(QMainWindow):
         content_layout = QHBoxLayout()
         self.image_tabs = QTabWidget()
         self.lbl_original = self._add_image_tab("Original / Overlay")
+        self.lbl_original.maskBrushClicked.connect(self._apply_mask_brush)
         self.lbl_enhanced = self._add_image_tab("Enhanced")
         self.lbl_mask = self._add_image_tab("Breast Mask")
         self.lbl_density = self._add_image_tab("Density Map")
@@ -179,26 +182,42 @@ class MammographyCADApp(QMainWindow):
         layout.addStretch()
         return layout
 
-    def _build_visualization_controls(self) -> QHBoxLayout:
+    def _build_visualization_controls(self) -> QVBoxLayout:
+        rows = QVBoxLayout()
         layout = QHBoxLayout()
+        rows.addLayout(layout)
 
         self.check_show_labels = QCheckBox("Labels")
-        self.check_show_tumors = QCheckBox("Masses")
+        self.check_show_tumors = QCheckBox("Mass boxes")
+        self.check_show_confidence = QCheckBox("Scores")
+        self.check_show_calc_masks = QCheckBox("Calc pixels")
+        self.check_show_calc_labels = QCheckBox("Calc labels")
+        self.check_show_calc_labels.setChecked(True)
+        self.check_show_calc_labels.toggled.connect(self.on_visualization_changed)
+        self.check_show_clusters = QCheckBox("Clusters")
+        self.check_show_original = QCheckBox("Original only")
+        self.check_show_original.toggled.connect(self.on_visualization_changed)
+        layout.addWidget(self.check_show_original)
         self.check_show_calcs = QCheckBox("Calcifications")
         self.check_show_arrows = QCheckBox("Arrows")
-        self.check_show_mask_layer = QCheckBox("Mask layer")
+        self.check_show_mask_layer = QCheckBox("Mass masks")
         self.check_show_pectoral = QCheckBox("Pectoral boundary")
         self.check_show_heatmap = QCheckBox("Density heatmap")
 
         for check in (
             self.check_show_labels, self.check_show_tumors, self.check_show_calcs,
             self.check_show_arrows, self.check_show_mask_layer,
-            self.check_show_pectoral, self.check_show_heatmap,
+            self.check_show_pectoral, self.check_show_heatmap, self.check_show_confidence,
+            self.check_show_calc_masks, self.check_show_clusters,
         ):
             check.setChecked(True)
             check.toggled.connect(self.on_visualization_changed)
             layout.addWidget(check)
 
+        layout.addStretch()
+        layout = QHBoxLayout()
+        rows.addLayout(layout)
+        layout.addWidget(self.check_show_calc_labels)
         layout.addWidget(QLabel("Thickness:"))
         self.slider_line_thickness = QSlider(Qt.Orientation.Horizontal)
         self.slider_line_thickness.setRange(1, 8)
@@ -218,7 +237,7 @@ class MammographyCADApp(QMainWindow):
         layout.addStretch()
         self.lbl_processing_info = QLabel("Ready")
         layout.addWidget(self.lbl_processing_info)
-        return layout
+        return rows
 
     def _add_image_tab(self, title: str) -> ZoomableImageLabel:
         label = ZoomableImageLabel()
@@ -238,7 +257,40 @@ class MammographyCADApp(QMainWindow):
         panel.addTab(self._build_lesion_tab(), "Lesion detail")
         panel.addTab(self._build_settings_tab(), "Settings")
         panel.addTab(self._build_info_tab(), "Models / Info")
+        panel.addTab(self._build_log_tab(), "Log management")
         return panel
+
+    def _build_log_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.activity_log = QTextEdit()
+        self.activity_log.setReadOnly(True)
+        self.activity_log.document().setMaximumBlockCount(1000)
+        layout.addWidget(self.activity_log)
+        button = QPushButton("Export activity log")
+        button.clicked.connect(self._export_activity_log)
+        layout.addWidget(button)
+        self._activity("Application started; primary processing device: CPU")
+        return tab
+
+    def _activity(self, message, level="INFO"):
+        self.activity_log.append(f"{datetime.now().isoformat(timespec='seconds')} [{level}] {message}")
+
+    def _export_activity_log(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export activity log", "activity.txt", "Text (*.txt)")
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as stream:
+                    stream.write(self.activity_log.toPlainText() + '\n')
+            except OSError as exc:
+                self._notify("Log export failed", str(exc), "error")
+
+    def _log_processing_stage(self, value):
+        stages = {3: 'Loading image', 10: 'Image decoded', 18: 'Breast preprocessing complete',
+                  30: 'Segmentation stage complete', 36: 'Pectoral stage complete',
+                  55: 'Mass candidate stage complete', 68: 'Calcification candidate stage complete'}
+        if value in stages:
+            self._activity(stages[value])
 
     def _build_results_tab(self) -> QWidget:
         widget = QWidget()
@@ -372,6 +424,20 @@ class MammographyCADApp(QMainWindow):
         self.lbl_selected_lesion = QLabel("No region selected")
         self.lbl_selected_lesion.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         layout.addWidget(self.lbl_selected_lesion)
+
+        self.lbl_mass_evidence = QLabel()
+        self.lbl_mass_evidence.setWordWrap(True)
+        layout.addWidget(self.lbl_mass_evidence)
+        self.mask_mode = QComboBox()
+        self.mask_mode.addItems(["Inspect / pan", "Add pixels (click)", "Remove pixels (click)"])
+        self.mask_mode.currentIndexChanged.connect(self.on_visualization_changed)
+        layout.addWidget(self.mask_mode)
+        edit_actions = QHBoxLayout()
+        for text, slot in (("Undo brush", self._undo_mask_edit), ("Restore automatic", self._restore_automatic_mask)):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            edit_actions.addWidget(button)
+        layout.addLayout(edit_actions)
 
         self.group_characterization = QGroupBox("Mass characterisation (ACR lexicon)")
         char_form = QFormLayout(self.group_characterization)
@@ -604,9 +670,13 @@ class MammographyCADApp(QMainWindow):
 
             gray, metadata = MammographyPreprocessor.load_image(path)
         except Exception as exc:
+            self._activity("Image load failed; see error dialog for details", "ERROR")
             self._notify("Error", f"Failed to load image:\n{exc}", "error")
             return False
 
+        self._activity("Image loaded")
+        self._mask_undo = None
+        self.lbl_original.mask_brush_active = False
         self.current_image_path = path
         self.current_result = None
         self.current_overlay = None
@@ -656,6 +726,7 @@ class MammographyCADApp(QMainWindow):
 
         self.worker = CADWorker(self.current_image_path, self, self.cad_system)
         self.worker.progress.connect(self.progress.setValue)
+        self.worker.progress.connect(self._log_processing_stage)
         self.worker.result_ready.connect(self.on_analysis_ready)
         self.worker.error.connect(self.on_process_error)
         self.worker.cancelled.connect(self.on_process_cancelled)
@@ -680,10 +751,15 @@ class MammographyCADApp(QMainWindow):
 
     @pyqtSlot(object)
     def on_analysis_ready(self, result: AnalysisResult) -> None:
+        self._mask_undo = None
+        self.mask_mode.setCurrentIndex(0)
         self.current_result = result
         self.current_detections = list(result.detections)
         self.current_statistics = dict(result.statistics or {})
         self.processing_time = float(result.processing_time or 0.0)
+        self._activity(f"Analysis returned {len(result.detections)} findings in {self.processing_time:.2f}s")
+        if result.warnings:
+            self._activity(f"{len(result.warnings)} analysis warning(s); see result report", "WARNING")
         self.selected_detection_id = None
 
         self.lbl_processing_info.setText(
@@ -720,6 +796,7 @@ class MammographyCADApp(QMainWindow):
         )
 
     def on_process_error(self, message: str) -> None:
+        self._activity("Analysis failed; see error dialog for details", "ERROR")
         self._notify("Processing error", f"Analysis failed:\n{message}", "error")
         self._set_idle("Processing failed")
         self.progress.setValue(0)
@@ -763,6 +840,10 @@ class MammographyCADApp(QMainWindow):
 
         visualizer = self.cad_system.visualizer
         visualizer.show_labels = self.check_show_labels.isChecked()
+        visualizer.show_confidence = self.check_show_confidence.isChecked()
+        visualizer.show_calc_labels = self.check_show_calc_labels.isChecked()
+        visualizer.show_calc_masks = self.check_show_calc_masks.isChecked()
+        visualizer.show_cluster_outlines = self.check_show_clusters.isChecked()
         visualizer.show_tumors = self.check_show_tumors.isChecked()
         visualizer.show_calcifications = self.check_show_calcs.isChecked()
         visualizer.show_arrows = self.check_show_arrows.isChecked()
@@ -790,9 +871,13 @@ class MammographyCADApp(QMainWindow):
             self.status.showMessage(f"Overlay rendering failed: {exc}")
             self.current_overlay = cv2.cvtColor(result.original, cv2.COLOR_GRAY2BGR)
 
-        self.lbl_original.set_image(self.current_overlay)
-        self.lbl_original.set_detections(result.detections)
-        self.lbl_original.highlight_detection(self.selected_detection_id)
+        original_only = self.check_show_original.isChecked()
+        self.lbl_original.mask_brush_active = not original_only and self.mask_mode.currentIndex() != 0
+        self.lbl_original.set_image(result.original if original_only else self.current_overlay)
+        self.lbl_original.set_detections([] if original_only else result.detections)
+        self.lbl_original.highlight_detection(
+            None if original_only or not self.check_show_tumors.isChecked() else self.selected_detection_id
+        )
 
     # ================================================================== #
     #  Selection                                                         #
@@ -897,12 +982,12 @@ class MammographyCADApp(QMainWindow):
             values = [
                 str(index),
                 detection.type.value.replace("_", " ").title(),
-                f"{detection.confidence:.0%}",
+                f"{detection.confidence:.2f}",
                 f"{detection.location[0]}, {detection.location[1]}",
                 (
-                    f"{measurement.get('max_diameter_mm', detection.diameter_mm):.1f}"
-                    if measurement or detection.diameter_mm
-                    else "-"
+                    f"{measurement.get('max_diameter_mm', 0):.1f} mm"
+                    if measurement.get('spacing_available') else
+                    f"{measurement.get('max_diameter_px', 0):.1f} px" if measurement else "-"
                 ),
                 f"{shape} / {margin}" if characterization else "-",
                 "ignored" if detection.is_ignored else "included",
@@ -924,7 +1009,7 @@ class MammographyCADApp(QMainWindow):
             text = (
                 f"{detection.lesion_id or detection.id}. "
                 f"{detection.type.value.replace('_', ' ').title()} "
-                f"({detection.confidence:.0%})"
+                f"(score {detection.confidence:.2f})"
             )
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, detection.id)
@@ -1043,6 +1128,85 @@ class MammographyCADApp(QMainWindow):
     # ================================================================== #
     #  Lesion detail                                                     #
     # ================================================================== #
+    def _editable_mass(self):
+        if self.current_result is None or self.check_show_original.isChecked():
+            return None
+        detection = self.get_detection_by_id(self.selected_detection_id)
+        if detection and not detection.is_ignored and detection.mask is not None and detection.type in (
+                DetectionType.TUMOR_SUSPICIOUS, DetectionType.TUMOR_CONFIRMED):
+            return detection
+        return None
+
+    def _apply_mask_brush(self, x, y):
+        detection = self._editable_mass()
+        mode = self.mask_mode.currentIndex()
+        if detection is None or not mode:
+            self.status.showMessage("Select a mass with an automatic mask before editing.")
+            return
+        h, w = detection.mask.shape
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        radius = Config.MASK_BRUSH_RADIUS_PX
+        x0, x1, y0, y1 = max(0,x-radius), min(w,x+radius+1), max(0,y-radius), min(h,y+radius+1)
+        patch = detection.mask[y0:y1,x0:x1]
+        yy, xx = np.ogrid[y0:y1,x0:x1]
+        brush = (xx-x)**2+(yy-y)**2 <= radius**2
+        if mode == 1:
+            brush &= self.current_result.breast_mask[y0:y1,x0:x1] > 0
+            if not np.any((patch > 0) & cv2.dilate(brush.astype(np.uint8), np.ones((3,3),np.uint8)).astype(bool)):
+                self.status.showMessage("Add pixels next to the selected mask boundary.")
+                return
+        new_value = 255 if mode == 1 else 0
+        if not np.any(brush & (patch != new_value)):
+            return
+        if mode == 2 and np.count_nonzero(patch[brush]) == np.count_nonzero(detection.mask):
+            self.status.showMessage("The final remaining mask pixels cannot be erased.")
+            return
+        if detection.automatic_mask is None:
+            detection.automatic_mask = detection.mask.copy()
+        self._mask_undo = (detection, (x0,y0,x1,y1), patch.copy())
+        patch[brush] = new_value
+        self._refresh_mask_measurements(detection)
+
+    def _undo_mask_edit(self):
+        detection = self._editable_mass()
+        if self._mask_undo is None or self._mask_undo[0] is not detection:
+            return
+        _, (x0,y0,x1,y1), patch = self._mask_undo
+        detection.mask[y0:y1,x0:x1] = patch
+        self._mask_undo = None
+        self._refresh_mask_measurements(detection)
+
+    def _restore_automatic_mask(self):
+        detection = self._editable_mass()
+        if detection is not None and detection.automatic_mask is not None:
+            detection.mask = detection.automatic_mask.copy()
+            self._mask_undo = None
+            self._refresh_mask_measurements(detection)
+
+    def _refresh_mask_measurements(self, detection):
+        mask = detection.mask
+        detection.bbox = cv2.boundingRect(mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        detection.contour = max(contours, key=cv2.contourArea)
+        edited = not np.array_equal(mask, detection.automatic_mask)
+        detection.features['mask_origin'] = 'manual correction' if edited else 'automatic'
+        meta = self.current_result.image_metadata or {}
+        row, col = meta.get('pixel_spacing', (1., 1.))
+        measurement = self.cad_system.measurement_engine.measure_detection(
+            detection, col, row, spacing_known=bool(meta.get('spacing_known')))
+        for name in ('area_px', 'area_mm2', 'diameter_px', 'diameter_mm'):
+            setattr(detection, name, float(measurement.get(name, 0) or 0))
+        detection.features['measurement'] = measurement
+        self.current_result.measurements = [d.features['measurement'] for d in self.current_result.detections
+                                            if d.features.get('measurement')]
+        warning = 'Manual mask corrections update geometry only; automated scores and descriptors remain from the original run.'
+        if edited and warning not in self.current_result.warnings:
+            self.current_result.warnings.append(warning)
+        self.update_visualization()
+        self.update_results_display()
+        self.show_lesion_details(detection.id)
+
     def show_lesion_details(self, detection_id: int) -> None:
         detection = self.get_detection_by_id(detection_id)
         if detection is None:
@@ -1058,8 +1222,18 @@ class MammographyCADApp(QMainWindow):
         self.lbl_selected_lesion.setText(
             f"{detection.lesion_id or detection.id} - "
             f"{detection.type.value.replace('_', ' ').title()} "
-            f"({detection.confidence:.0%} confidence)"
+            f"(evidence score {detection.confidence:.2f})"
         )
+
+        if 'segmentation_confidence' in features:
+            state = features.get('mask_origin', 'automatic' if detection.mask is not None else 'no reliable mask')
+            self.lbl_mass_evidence.setText(
+                f"Mask: {state}; automatic agreement score: {features['segmentation_confidence']:.2f}. "
+                f"Detector support: {features['detector_support']}/5. "
+                f"Pectoral overlap: {features.get('pectoral_overlap', 0.):.0%}. "
+                + ('Review advised.' if features.get('needs_review') else ''))
+        else:
+            self.lbl_mass_evidence.clear()
 
         if characterization.get("available"):
             self.lbl_shape.setText(str(characterization.get("shape")))
@@ -1090,6 +1264,10 @@ class MammographyCADApp(QMainWindow):
                 f"{measurement.get('perimeter_mm', 0):.2f} mm"
             )
             self.lbl_circularity.setText(self._format_metric(measurement.get("circularity")))
+            if not measurement.get("spacing_available"):
+                self.lbl_max_diameter.setText(f"{measurement.get('max_diameter_px', 0):.1f} px")
+                self.lbl_area.setText(f"{measurement.get('area_px', 0):.0f} px²")
+                self.lbl_perimeter.setText(f"{measurement.get('perimeter_px', 0):.1f} px")
             self.lbl_measurement_basis.setText(
                 measurement.get("spacing_basis")
                 or (
@@ -1140,6 +1318,7 @@ class MammographyCADApp(QMainWindow):
         self.text_explanation.setPlainText("\n".join(lines))
 
     def clear_lesion_panel(self) -> None:
+        self.lbl_mass_evidence.clear()
         self.lbl_selected_lesion.setText("No region selected")
         for label in (
             self.lbl_shape, self.lbl_margin, self.lbl_lesion_density,
@@ -1176,10 +1355,21 @@ class MammographyCADApp(QMainWindow):
             logger.exception("Report export failed")
             self._notify("Export failed", str(exc), "error")
             return
+        extras = []
+        for extension, export in (("pdf", self.report_builder.save_pdf), ("docx", self.report_builder.save_docx)):
+            try:
+                extras.append(export(self.current_result, f"{paths['base']}.{extension}"))
+            except ImportError:
+                extras.append(f"{extension.upper()} unavailable: install python-docx for Word export")
+            except Exception as exc:
+                logger.exception("%s report export failed", extension.upper())
+                extras.append(f"{extension.upper()} export failed: {type(exc).__name__}")
+        self._activity("Report export finished; see export dialog for format status")
+        additional = "\n".join(extras)
         self._notify(
             "Report exported",
             "Reports written to:\n\n"
-            f"{paths['json']}\n{paths['html']}\n\n"
+            f"{paths['json']}\n{paths['html']}\n{additional}\n\n"
             "The report is a software-assisted analysis, not a diagnosis.",
         )
         self.status.showMessage(f"Report exported: {paths['html']}")

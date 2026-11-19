@@ -151,6 +151,7 @@ class ReportBuilder:
 <span class="badge">Not a medical diagnosis</span>
 <span class="badge">Generated {generated}</span></div>
 
+<p style="color:#a00000"><b>{disclaimer}</b></p>
 <h2>Study and image</h2>
 {header_table}
 
@@ -214,6 +215,65 @@ must be verified by a qualified radiologist.</div>
         self.save_json(result, json_path)
         self.save_html(result, html_path)
         return {"json": json_path, "html": html_path, "base": root}
+
+    def save_pdf(self, result, path: str) -> str:
+        """Export from the GUI thread using the existing Qt runtime."""
+        from PyQt6.QtGui import QPageSize, QPdfWriter, QTextDocument
+        from PyQt6.QtWidgets import QApplication
+
+        if QApplication.instance() is None:
+            raise RuntimeError("PDF export requires a running Qt application")
+        document = QTextDocument()
+        document.setHtml(self.build_html(result, include_images=False))
+        writer = QPdfWriter(path)
+        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        document.print(writer)
+        return path
+
+    def save_docx(self, result, path: str) -> str:
+        """Write a research summary; the companion JSON holds full spot records."""
+        from io import BytesIO
+        from docx import Document
+        from docx.shared import Inches, RGBColor
+
+        doc = Document()
+        doc.add_heading('MammographyCAD research report', 0)
+        warning = doc.add_paragraph().add_run(Config.REPORT_DISCLAIMER)
+        warning.bold = True
+        warning.font.color.rgb = RGBColor(160, 0, 0)
+        doc.add_heading('Image and analysis', level=1)
+        meta = self._meta(result)
+        doc.add_paragraph(f"Grid: {result.original.shape[1]} × {result.original.shape[0]} pixels")
+        doc.add_paragraph(f"Pixel spacing: {meta['pixel_spacing']}")
+        from datetime import datetime, timezone
+        doc.add_paragraph(f"Exported: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+        density = result.density_result or {}
+        doc.add_paragraph(f"Density estimate: {density.get('acr_category', 'not available')}")
+        doc.add_heading('Candidate findings', level=1)
+        for d in result.detections:
+            f = d.features or {}
+            m = f.get('measurement', {})
+            source = f.get('mask_origin', 'automatic' if d.mask is not None else 'none')
+            doc.add_paragraph(f"{d.lesion_id}: {d.type.value}; centre {d.location} px; "
+                              f"evidence score {d.confidence:.2f}; mask: {source}; "
+                              f"area {m.get('area_px', 'n/a')} px²; "
+                              f"equivalent diameter {m.get('equivalent_diameter_px', 'n/a')} px; "
+                              f"uncertainty {d.uncertainty:.2f}" + ('; ignored' if d.is_ignored else ''))
+            spots = f.get('individual_calcifications', [])
+            if spots:
+                doc.add_paragraph(f"Member coordinates (px): {[s['center'] for s in spots]}")
+            if f.get('needs_review'):
+                doc.add_paragraph('Review advised: weak segmentation agreement or anatomical overlap.')
+        overlay = self._overlay(result)
+        if overlay is not None:
+            ok, png = cv2.imencode('.png', overlay)
+            if ok:
+                doc.add_picture(BytesIO(png.tobytes()), width=Inches(5))
+        doc.add_heading('Warnings', level=1)
+        for message in result.warnings:
+            doc.add_paragraph(str(message), style='List Bullet')
+        doc.save(path)
+        return path
 
     def default_path(self, result, extension: str) -> str:
         name = self._base_name(result)
@@ -307,14 +367,18 @@ must be verified by a qualified radiologist.</div>
             features = detection.features or {}
             characterization = features.get("mass_characterization") or {}
             measurement = features.get("measurement") or {}
+            diameter = (self._fmt(measurement.get('max_diameter_mm'), suffix=' mm')
+                        if measurement.get('spacing_available') else
+                        self._fmt(measurement.get('max_diameter_px'), suffix=' px'))
             rows.append(
                 "<tr>"
                 f"<td>{index}</td>"
                 f"<td>{html.escape(detection.lesion_id or str(detection.id))}</td>"
                 f"<td>{html.escape(detection.type.value.replace('_', ' ').title())}</td>"
                 f"<td>{detection.location[0]}, {detection.location[1]}</td>"
-                f"<td>{self._fmt(detection.confidence, percent=True)}</td>"
-                f"<td>{self._fmt(measurement.get('max_diameter_mm'), suffix=' mm')}</td>"
+                f"<td>{self._fmt(detection.confidence)}</td>"
+                f"<td>{html.escape(str(features.get('mask_origin', 'automatic' if detection.mask is not None else 'none')))}</td>"
+                f"<td>{diameter}</td>"
                 f"<td>{html.escape(str(characterization.get('shape', '-')))}</td>"
                 f"<td>{html.escape(str(characterization.get('margin', '-')))}</td>"
                 f"<td>{html.escape(str(characterization.get('density', '-')))}</td>"
@@ -323,7 +387,7 @@ must be verified by a qualified radiologist.</div>
             )
         header = (
             "<tr><th>#</th><th>Lesion</th><th>Type</th><th>Centre (px)</th>"
-            "<th>Confidence</th><th>Max diameter</th><th>Shape</th><th>Margin</th>"
+            "<th>Evidence score</th><th>Mask source</th><th>Max diameter</th><th>Shape</th><th>Margin</th>"
             "<th>Density</th><th>Status</th></tr>"
         )
         return f"<table>{header}{''.join(rows)}</table>"

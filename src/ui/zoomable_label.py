@@ -33,6 +33,7 @@ from ..core.detection_types import Detection
 
 class ZoomableImageLabel(QLabel):
     detectionClicked = pyqtSignal(int)
+    maskBrushClicked = pyqtSignal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -50,6 +51,7 @@ class ZoomableImageLabel(QLabel):
         self._has_dragged = False
         self._drag_threshold = 4
         self._auto_fit = True
+        self.mask_brush_active = False
 
         self.detections: List[Detection] = []
         self.highlighted_detection: Optional[int] = None
@@ -264,6 +266,11 @@ class ZoomableImageLabel(QLabel):
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent):  # noqa: N802 - Qt naming
+        if self.mask_brush_active and event.button() == Qt.MouseButton.LeftButton and self._pixmap is not None:
+            point = self._screen_to_image_coords(event.position())
+            self.maskBrushClicked.emit(int(np.floor(point.x())), int(np.floor(point.y())))
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._pixmap is not None:
             self._pan_start = event.position()
             self._press_pos = event.position()

@@ -17,3 +17,6 @@ torchvision>=0.16
 ultralytics>=8.2      # YOLOv8/YOLO11 + RT-DETR inference and training
 onnxruntime>=1.17     # ONNX checkpoints (optional)
 pyyaml>=6.0           # training/evaluation config files
+
+# DOCX research report export (PDF uses the existing PyQt6 runtime)
+python-docx>=1.1
